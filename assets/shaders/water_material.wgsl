@@ -35,7 +35,7 @@ fn vertex(in: Vertex) -> VertexOutput {
     let amplitude = 0.1;
     let frequency = 1.;
     let wave = frequency * wave_coord + params.time;
-    world_pos.y = amplitude * sin(wave);
+    world_pos.y += amplitude * sin(wave);
 
     // the plan here is we take this normal and use it for our deferred normal calculation
     let dydx = amplitude * frequency * cos(wave);

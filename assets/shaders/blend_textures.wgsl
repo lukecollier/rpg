@@ -77,7 +77,12 @@ fn fragment(
     final_color += textureSample(ground_textures, ground_textures_sampler, uv_coords, i32(3)) * weights.a;
 
     // depending on the height we should change the slope index
-    let slope_color = textureSample(slope_textures, slope_textures_sampler, uv_coords, i32(1));
+    var slope_color = vec4<f32>(0.);
+    slope_color += textureSample(slope_textures, slope_textures_sampler, uv_coords, i32(0)) * weights.r;
+    slope_color += textureSample(slope_textures, slope_textures_sampler, uv_coords, i32(1)) * weights.g;
+    slope_color += textureSample(slope_textures, slope_textures_sampler, uv_coords, i32(2)) * weights.b;
+    slope_color += textureSample(slope_textures, slope_textures_sampler, uv_coords, i32(3)) * weights.a;
+
     final_color = mix(final_color, slope_color, slope_factor);
 
     pbr_input.material.base_color = clamp(final_color, vec4<f32>(0.), vec4<f32>(1.));
@@ -96,7 +101,11 @@ fn fragment(
     tex_N += unpack_normal(textureSample(ground_normals, ground_normals_sampler, uv_coords, i32(3))) * weights.a;
 
     // depending on the height we should change the slope index
-    let slope_normal = unpack_normal(textureSample(slope_normals, slope_normals_sampler, uv_coords, i32(0)));
+    var slope_normal = vec3<f32>(0.);
+    slope_normal += unpack_normal(textureSample(slope_normals, slope_normals_sampler, uv_coords, i32(0))) * weights.r;
+    slope_normal += unpack_normal(textureSample(slope_normals, slope_normals_sampler, uv_coords, i32(1))) * weights.g;
+    slope_normal += unpack_normal(textureSample(slope_normals, slope_normals_sampler, uv_coords, i32(2))) * weights.b;
+    slope_normal += unpack_normal(textureSample(slope_normals, slope_normals_sampler, uv_coords, i32(3))) * weights.a;
     tex_N = mix(tex_N, slope_normal, slope_factor);
 
     let final_N = normalize(mix(vertex_N, tex_N, 0.5));
