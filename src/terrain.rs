@@ -1,4 +1,4 @@
-use std::{borrow::Cow, collections::HashSet, time::Duration};
+use std::{borrow::Cow, collections::VecDeque, time::Duration};
 
 use avian3d::prelude::*;
 use bevy::{
@@ -7,23 +7,25 @@ use bevy::{
     color::palettes::css::*,
     gltf::GltfMeshName,
     image::{Image, ImageAddressMode, ImageLoaderSettings, ImageSampler, ImageSamplerDescriptor},
+    math::bounding::{Aabb2d, BoundingVolume},
     mesh::{Indices, PrimitiveTopology, VertexAttributeValues},
     pbr::{
         ExtendedMaterial, MaterialExtension, MaterialPlugin, StandardMaterial, wireframe::Wireframe,
     },
+    platform::collections::{HashMap, HashSet},
     prelude::*,
     reflect::TypePath,
     render::{
-        RenderApp, RenderStartup,
+        Render, RenderApp, RenderStartup, RenderSystems,
         extract_component::{ExtractComponent, ExtractComponentPlugin},
         extract_resource::{ExtractResource, ExtractResourcePlugin},
         gpu_readback::{Readback, ReadbackComplete},
         render_asset::RenderAssets,
         render_graph::{self, RenderGraph, RenderLabel},
         render_resource::{
-            AsBindGroup, BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries,
+            AsBindGroup, BindGroup, BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries,
             CachedComputePipelineId, CachedPipelineState, ComputePassDescriptor,
-            ComputePipelineDescriptor, PipelineCache, ShaderStages, ShaderType, StorageBuffer,
+            ComputePipelineDescriptor, PipelineCache, ShaderStages, ShaderType,
             StorageTextureAccess, TextureFormat, TextureUsages, UniformBuffer,
             binding_types::{texture_storage_2d, uniform_buffer},
         },
@@ -34,20 +36,14 @@ use bevy::{
     scene::SceneInstanceReady,
     shader::{PipelineCacheError, ShaderRef},
 };
-use bytemuck::{Pod, Zeroable};
 
 // todo: Move these into terrain settings, we can have TerrainPlugin init the resource
-const CHUNK_SIZE: f32 = 64.;
-const TERRAIN_MAX_HEIGHT: f32 = 256.;
-const TERRAIN_VIEW_DISTANCE: f32 = 2048. * 2.;
-const LOD0_SUBDIVISIONS: u32 = 32;
-const LOD0_BUFFER_SIZE: u32 = 128;
-const LOD1_BUFFER_SIZE: u32 = 128;
-const LOD2_BUFFER_SIZE: u32 = 256;
-
-const HEIGHT_MAP_SIZE: u32 = 128;
-const LOD1_HEIGHT_MAP_SIZE: u32 = 64;
-const LOD2_HEIGHT_MAP_SIZE: u32 = 16;
+pub const CHUNK_HALF_SIZE: f32 = 128.;
+pub const CHUNK_SIZE: f32 = CHUNK_HALF_SIZE * 2.;
+pub const TERRAIN_SIZE: f32 = 2048. * 2.;
+// todo: This need's to be the number of vertices in the x y of all our high detail chunks I GUESS
+const HEIGHT_MAP_SIZE: u32 = 256;
+const TERRAIN_MAX_HEIGHT: f32 = 1024.;
 
 // After how many seconds of changes do we trigger a gpu readback for heightmaps
 const HEIGHTMAP_DEBOUNCE_SECS: u64 = 1;
@@ -71,6 +67,7 @@ impl Plugin for TerrainPlugin {
                 startup_test_tree,
                 TerrainGpuImages::startup,
                 TerrainHeightMaps::startup,
+                TerrainChunkView::setup,
             )
                 .chain(),
         )
@@ -95,7 +92,12 @@ impl Plugin for TerrainPlugin {
             ExtractComponentPlugin::<TerrainChunk>::default(),
         ));
         let render_app = app.sub_app_mut(RenderApp);
-        render_app.add_systems(RenderStartup, TerrainPipeline::init_pipeline);
+        render_app
+            .add_systems(RenderStartup, TerrainPipeline::init_pipeline)
+            .add_systems(
+                Render,
+                (TerrainBindGroups::prepare).in_set(RenderSystems::PrepareBindGroups),
+            );
         let mut render_graph = render_app.world_mut().resource_mut::<RenderGraph>();
         render_graph.add_node(TerrainRenderLabel, TerrainRenderNode::default());
         render_graph.add_node_edge(TerrainRenderLabel, bevy::render::graph::CameraDriverLabel);
@@ -613,12 +615,6 @@ fn generate_stitched_plane_south(
     mesh
 }
 
-/// Quad tree implementation that only cares about leaf nodes.
-#[derive(Debug, Clone)]
-pub struct SinglePointQuadTree {
-    nodes: Vec<(Rect, StitchIn)>,
-}
-
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub enum StitchIn {
     None,
@@ -633,16 +629,16 @@ pub enum StitchIn {
 }
 
 impl StitchIn {
-    fn from_neighbour_in(neighbour_ins: Vec<NeighbourIn>) -> Self {
+    fn from_neighbour_in(neighbour_ins: Vec<Neighbouring>) -> Self {
         match neighbour_ins.as_slice() {
-            [NeighbourIn::Top, NeighbourIn::Left] => Self::NorthWest,
-            [NeighbourIn::Top] => Self::North,
-            [NeighbourIn::Top, NeighbourIn::Right] => Self::NorthEast,
-            [NeighbourIn::Right] => Self::East,
-            [NeighbourIn::Right, NeighbourIn::Bottom] => Self::SouthEast,
-            [NeighbourIn::Bottom] => Self::South,
-            [NeighbourIn::Bottom, NeighbourIn::Left] => Self::SouthWest,
-            [NeighbourIn::Left] => Self::West,
+            [Neighbouring::Top, Neighbouring::Left] => Self::NorthWest,
+            [Neighbouring::Top] => Self::North,
+            [Neighbouring::Top, Neighbouring::Right] => Self::NorthEast,
+            [Neighbouring::Right] => Self::East,
+            [Neighbouring::Right, Neighbouring::Bottom] => Self::SouthEast,
+            [Neighbouring::Bottom] => Self::South,
+            [Neighbouring::Bottom, Neighbouring::Left] => Self::SouthWest,
+            [Neighbouring::Left] => Self::West,
             _ => Self::None,
         }
     }
@@ -663,161 +659,178 @@ impl StitchIn {
     }
 }
 
-impl SinglePointQuadTree {
-    fn debug(&self, gizmos: &mut Gizmos) {
-        for (node, direction) in &self.nodes {
+#[derive(Debug)]
+enum QuadNode {
+    Branch {
+        children: Box<[QuadNode; 4]>,
+        chunk: QuadChunk,
+    },
+    Leaf(QuadChunk),
+}
+
+#[derive(Debug)]
+struct QuadChunk {
+    bound: Aabb2d,
+    level: usize,
+    id: u32,
+}
+
+impl QuadChunk {
+    fn new(bounds: Aabb2d, level: usize) -> Self {
+        let id = Self::chunk_id(&bounds);
+        Self {
+            bound: bounds,
+            level,
+            id,
+        }
+    }
+
+    fn split(aabb: Aabb2d, level: usize) -> [Self; 4] {
+        QuadNode::split_bounds(aabb).map(|bounds| Self::new(bounds, level))
+    }
+
+    // Using the minimum chunk size to get our coordinates?!
+    fn pos(&self, chunk_size: Vec2) -> IVec2 {
+        let min = self.bound.min;
+        let ix = (min.x / chunk_size.x).floor() as i32;
+        let iy = (min.y / chunk_size.y).floor() as i32;
+        IVec2::new(ix, iy)
+    }
+
+    // todo: Chatgpt things this should be a morton code :shrug:
+    fn chunk_id(bounds: &Aabb2d) -> u32 {
+        let center = bounds.center();
+        let ix = center.x.floor() as i16;
+        let iy = center.y.floor() as i16;
+        ((ix as i32) << 16 | iy as i32) as u32
+    }
+}
+
+impl QuadNode {
+    fn chunk(&self) -> &QuadChunk {
+        match self {
+            QuadNode::Branch { children: _, chunk } => chunk,
+            QuadNode::Leaf(quad_chunk) => quad_chunk,
+        }
+    }
+    fn debug_chunks(&self, point: Vec2, gizmos: &mut Gizmos) {
+        for (_id, node) in &self.nodes_with_id(point) {
+            let chunk = node.chunk();
             gizmos.primitive_3d(
-                &Cuboid::new(node.half_size().x * 2., 0., node.half_size().y * 2.),
-                Isometry3d::from_translation(node.center().with_y(0.).extend(node.center().y)),
-                direction.to_color(),
+                &Cuboid::new(
+                    chunk.bound.half_size().x * 2.,
+                    0.,
+                    chunk.bound.half_size().y * 2.,
+                ),
+                Isometry3d::from_translation(
+                    chunk
+                        .bound
+                        .center()
+                        .with_y(1.)
+                        .extend(chunk.bound.center().y),
+                ),
+                BLUE,
+            );
+        }
+        for (_id, node) in &self.refined_nodes_with_id(point) {
+            let chunk = node.chunk();
+            gizmos.primitive_3d(
+                &Cuboid::new(
+                    chunk.bound.half_size().x * 2.,
+                    0.,
+                    chunk.bound.half_size().y * 2.,
+                ),
+                Isometry3d::from_translation(
+                    chunk
+                        .bound
+                        .center()
+                        .with_y(0.)
+                        .extend(chunk.bound.center().y),
+                ),
+                RED,
             );
         }
     }
 
-    fn new(bot_left: Vec2, top_right: Vec2, target_size: Vec2, point: Vec2) -> Self {
-        let mut tree = Self::init(bot_left, top_right, target_size, point);
-        let mut new_tree: Vec<Rect> = Vec::with_capacity(tree.len());
-        let mut finished = false;
-        while !finished {
-            new_tree.clear();
-
-            for (node, neighbours) in tree.clone().iter().zip(Self::neighbours(&tree)) {
-                // if our node has met the minimum subdivide we ignore it
-                if node.size() == target_size {
-                    new_tree.push(*node);
-                    continue;
+    /// Returns all chunks
+    fn all(&self) -> Vec<&QuadNode> {
+        let mut nodes = Vec::with_capacity(4);
+        match self {
+            QuadNode::Branch { children, chunk: _ } => {
+                nodes.push(self);
+                let child_array: &[QuadNode; 4] = children;
+                for child in child_array {
+                    nodes.extend(child.all());
                 }
-                let mut found = false;
-                for (_, neighbour) in neighbours {
-                    let resolution_diff =
-                        neighbour.size().length_squared() / node.size().length_squared();
-                    // resolution difference should be
-                    if resolution_diff > 1.0 {
-                        found = true;
-                        break;
+            }
+            QuadNode::Leaf(_) => nodes.push(self),
+        };
+        nodes
+    }
+
+    // step one is to find the chunk our point is in
+    fn refine<'a>(point: Vec2, nodes: &HashMap<u32, &'a QuadNode>) -> HashMap<u32, &'a QuadNode> {
+        let Some(start_node) = nodes.values().find(|node| {
+            let bound = node.chunk().bound;
+            let delta = point - bound.center();
+
+            delta.x.abs() <= bound.half_size().x && delta.y.abs() <= bound.half_size().y
+        }) else {
+            return nodes.clone();
+        };
+        let mut new_nodes = HashMap::new();
+        let mut queue: VecDeque<&QuadNode> = VecDeque::new();
+        let mut seen: HashSet<u32> = HashSet::new();
+        seen.insert(start_node.chunk().id);
+        queue.push_back(start_node);
+        while let Some(node) = queue.pop_front() {
+            let chunk = node.chunk();
+            let neighbours = node.neighbours(&nodes);
+            let mut should_refine = false;
+            for (_direction, neighbour_node) in &neighbours {
+                let neighbour_chunk = neighbour_node.chunk();
+                // do we refine our current chunk?
+                if chunk.level as i32 - neighbour_chunk.level as i32 > 1 {
+                    should_refine = true;
+                }
+                if seen.insert(neighbour_chunk.id) {
+                    queue.push_back(neighbour_node);
+                }
+            }
+            if should_refine {
+                match node {
+                    QuadNode::Branch { children, chunk: _ } => {
+                        let child_array: &[QuadNode; 4] = children;
+                        for child in child_array {
+                            new_nodes.insert(child.chunk().id, child);
+                        }
+                    }
+                    QuadNode::Leaf(quad_chunk) => {
+                        // we can't refine this chunk anymore, so when we get to the neighbour
+                        // we will refine it instead.
+                        new_nodes.insert(quad_chunk.id, node);
                     }
                 }
-                if found {
-                    let half_size = node.half_size();
-                    let center = node.center();
-                    let bot_left_quad = Rect::from_corners(node.min, node.min + half_size);
-                    let bot_right_quad = Rect::new(
-                        center.x,
-                        node.min.y,
-                        center.x + half_size.x,
-                        node.min.y + half_size.y,
-                    );
-                    let top_right_quad = Rect::from_corners(center, node.max);
-                    let top_left_quad = Rect::new(
-                        node.min.x,
-                        center.y,
-                        node.min.x + half_size.x,
-                        center.y + half_size.y,
-                    );
-                    let quads = [bot_left_quad, bot_right_quad, top_left_quad, top_right_quad];
-                    new_tree.extend(quads);
-                } else {
-                    new_tree.push(*node);
-                }
-            }
-            // if our tree hasn't grown then we finish our loop
-            if tree.len() == new_tree.len() {
-                finished = true;
-            }
-            tree = new_tree.clone();
-        }
-        let tree_with_dir =
-            tree.clone()
-                .into_iter()
-                .zip(Self::neighbours(&tree))
-                .map(|(a, neighbours)| {
-                    let mut valid_neighbours: Vec<NeighbourIn> = neighbours
-                        .into_iter()
-                        .filter(|(_, b)| {
-                            (b.size().length_squared() / a.size().length_squared()) > 1.
-                        })
-                        .map(|(neighbour_in, _)| neighbour_in)
-                        .collect::<HashSet<_>>()
-                        .into_iter()
-                        .collect();
-                    valid_neighbours.sort();
-                    (a, StitchIn::from_neighbour_in(valid_neighbours))
-                });
-        Self {
-            nodes: tree_with_dir.collect(),
-        }
-    }
-
-    /// todo: Need to add stitchdirection topkek
-    fn diff(self, other: SinglePointQuadTree) -> (Vec<(Rect, StitchIn)>, Vec<(Rect, StitchIn)>) {
-        let removed = other
-            .nodes
-            .clone()
-            .into_iter()
-            .filter(|a| !self.nodes.contains(a))
-            .collect();
-        let added = self
-            .nodes
-            .clone()
-            .into_iter()
-            .filter(|a| !other.nodes.contains(a))
-            .collect();
-        (added, removed)
-    }
-
-    fn init(bot_left: Vec2, top_right: Vec2, target_size: Vec2, point: Vec2) -> Vec<Rect> {
-        let origin = Rect::from_corners(bot_left, top_right);
-        let center = origin.center();
-        let half_size = origin.half_size();
-        let threshold = origin.min.distance_squared(center) * 0.50;
-        let mut leafs: Vec<Rect> = Vec::with_capacity(4);
-        let bot_left_quad = Rect::from_corners(origin.min, origin.min + half_size);
-        let bot_right_quad = Rect::new(
-            center.x,
-            origin.min.y,
-            center.x + half_size.x,
-            origin.min.y + half_size.y,
-        );
-        let top_right_quad = Rect::from_corners(center, origin.max);
-        let top_left_quad = Rect::new(
-            origin.min.x,
-            center.y,
-            origin.min.x + half_size.x,
-            center.y + half_size.y,
-        );
-        let quads = [bot_left_quad, bot_right_quad, top_left_quad, top_right_quad];
-
-        // todo: We want to do this in breadth first order,
-        // this is so when we diff later on we can quickly determine where need's updating.
-        // so if our top left quad hasn't updated we will zip together all our quads and validate
-        // which specific quads have been updated more quickly.
-        for quad in quads {
-            if quad.center().distance_squared(point) < threshold
-                && quad.size().x > target_size.x
-                && quad.size().y > target_size.y
-            {
-                let children = Self::init(quad.min, quad.max, target_size, point);
-                leafs.extend(children);
             } else {
-                leafs.push(quad);
+                new_nodes.insert(chunk.id, node);
             }
         }
-        leafs
+        return new_nodes;
     }
 
     /// Returns the direction *from r1 to r2* if they border each other.
     /// Returns None if they do not touch or only touch at a corner.
-    pub fn bordering_direction(r1: &Rect, r2: &Rect) -> Option<NeighbourIn> {
+    pub fn bordering_direction(b1: &Aabb2d, b2: &Aabb2d) -> Option<Neighbouring> {
         // Convenience
-        let r1_left = r1.min.x;
-        let r1_right = r1.max.x;
-        let r1_bottom = r1.min.y;
-        let r1_top = r1.max.y;
+        let r1_left = b1.min.x;
+        let r1_right = b1.max.x;
+        let r1_bottom = b1.min.y;
+        let r1_top = b1.max.y;
 
-        let r2_left = r2.min.x;
-        let r2_right = r2.max.x;
-        let r2_bottom = r2.min.y;
-        let r2_top = r2.max.y;
+        let r2_left = b2.min.x;
+        let r2_right = b2.max.x;
+        let r2_bottom = b2.min.y;
+        let r2_top = b2.max.y;
 
         // --- Shared edge overlap helpers ---
         let overlap_x = r1_left < r2_right && r1_right > r2_left;
@@ -825,138 +838,122 @@ impl SinglePointQuadTree {
 
         // --- Check top adjacency (r2 is directly above r1) ---
         if (r1_top == r2_bottom) && overlap_x {
-            return Some(NeighbourIn::Top);
+            return Some(Neighbouring::Top);
         }
 
         // --- Check bottom adjacency (r2 is directly below r1) ---
         if (r1_bottom == r2_top) && overlap_x {
-            return Some(NeighbourIn::Bottom);
+            return Some(Neighbouring::Bottom);
         }
 
         // --- Check right adjacency (r2 is directly right of r1) ---
         if (r1_right == r2_left) && overlap_y {
-            return Some(NeighbourIn::Right);
+            return Some(Neighbouring::Right);
         }
 
         // --- Check left adjacency (r2 is directly left of r1) ---
         if (r1_left == r2_right) && overlap_y {
-            return Some(NeighbourIn::Left);
+            return Some(Neighbouring::Left);
         }
 
         None
     }
 
-    /// Using this method we can determine when to drop resolutions
-    fn neighbours(tree: &Vec<Rect>) -> Vec<Vec<(NeighbourIn, Rect)>> {
-        tree.iter()
-            .map(|rect| {
-                tree.iter()
-                    .filter_map(|other_rect| {
-                        Self::bordering_direction(rect, other_rect)
-                            .map(|direction| (direction, *other_rect))
-                    })
-                    .collect()
-            })
-            .collect()
+    // annoyingly we have to go trhough every chunk in the
+    fn neighbours<'a>(
+        &self,
+        nodes: &HashMap<u32, &'a QuadNode>,
+    ) -> Vec<(Neighbouring, &'a QuadNode)> {
+        let mut neighbours: Vec<(Neighbouring, &'a QuadNode)> = Vec::with_capacity(4);
+        let chunk = self.chunk();
+        for (_key, neighbour_node) in nodes {
+            let neighbour_chunk = neighbour_node.chunk();
+            if let Some(neighbouring) =
+                Self::bordering_direction(&chunk.bound, &neighbour_chunk.bound)
+            {
+                neighbours.push((neighbouring, neighbour_node));
+            }
+        }
+        neighbours
     }
-}
 
-#[cfg(test)]
-mod quad_tree_tests {
-    use bevy::math::{Rect, Vec2};
-
-    use super::NeighbourIn;
-    use super::SinglePointQuadTree;
-
-    #[test]
-    fn new_fix() {
-        let r = Rect {
-            min: Vec2::new(-1024.0, -2048.0),
-            max: Vec2::new(0.0, -1024.0),
+    /// Returns a list of the nodes to be rendered
+    /// we could return an Option, this way we can add entities later
+    fn nodes_with_id(&self, point: Vec2) -> HashMap<u32, &QuadNode> {
+        let mut nodes = HashMap::default();
+        // note: For the subdivide check we currently just get the diagonal size, if we're within
+        // that distance from the quad's center we subdivide
+        match self {
+            QuadNode::Branch { children, chunk }
+                if (chunk.bound.center().distance_squared(point) as u32)
+                    < (((chunk.bound.half_size().x + chunk.bound.half_size().y) * 1.25) as u32)
+                        .pow(2) =>
+            {
+                let child_array: &[QuadNode; 4] = children;
+                for child in child_array {
+                    nodes.extend(child.nodes_with_id(point));
+                }
+            }
+            QuadNode::Branch { children: _, chunk } => {
+                nodes.insert(chunk.id, self);
+            }
+            QuadNode::Leaf(chunk) => {
+                nodes.insert(chunk.id, self);
+            }
         };
-        let r1 = Rect {
-            min: Vec2::new(-2048.0, -2048.0),
-            max: Vec2::new(-1024.0, -1024.0),
-        };
-        let r2 = Rect {
-            min: Vec2::new(-1024.0, -1024.0),
-            max: Vec2::new(-512.0, -512.0),
-        };
-        let r3 = Rect {
-            min: Vec2::new(-512.0, -1024.0),
-            max: Vec2::new(0.0, -512.0),
-        };
-        let r4 = Rect {
-            min: Vec2::new(0.0, -2048.0),
-            max: Vec2::new(1024.0, -1024.0),
-        };
-        assert_eq!(
-            SinglePointQuadTree::bordering_direction(&r, &r1),
-            Some(NeighbourIn::Left)
+        nodes
+    }
+
+    // todo: We need to encode which directions we need to stitch in
+    fn refined_nodes_with_id(&self, point: Vec2) -> HashMap<u32, &QuadNode> {
+        let mut nodes = self.nodes_with_id(point);
+        loop {
+            let refined_nodes = Self::refine(point, &nodes);
+            if nodes.len() == refined_nodes.len() {
+                return refined_nodes;
+            }
+            nodes = refined_nodes;
+        }
+    }
+
+    fn split_bounds(bounds: Aabb2d) -> [Aabb2d; 4] {
+        let quarter_size = bounds.half_size() / 2.;
+        let center = bounds.center();
+        let bot_left = Aabb2d::new(center - quarter_size, quarter_size);
+        let top_right = Aabb2d::new(center + quarter_size, quarter_size);
+        let top_left = Aabb2d::new(
+            Vec2::new(center.x - quarter_size.x, center.y + quarter_size.y),
+            quarter_size,
         );
-        assert_eq!(
-            SinglePointQuadTree::bordering_direction(&r, &r2),
-            Some(NeighbourIn::Top)
+        let bot_right = Aabb2d::new(
+            Vec2::new(center.x + quarter_size.x, center.y - quarter_size.y),
+            quarter_size,
         );
-        assert_eq!(SinglePointQuadTree::bordering_direction(&r, &r3), None);
-        assert_eq!(
-            SinglePointQuadTree::bordering_direction(&r, &r4),
-            Some(NeighbourIn::Right)
-        );
+        [top_left, top_right, bot_left, bot_right]
     }
 
-    #[test]
-    fn ensure_fix() {
-        let r1 = Rect::new(0., 0., 32., 32.);
-        let r2 = Rect::new(64., 0., 96., 32.);
-        assert_eq!(SinglePointQuadTree::bordering_direction(&r1, &r2), None);
-    }
+    fn new(bounds: Aabb2d, depth: usize) -> Self {
+        if depth == 1 {
+            todo!("return a single root node");
+        }
 
-    #[test]
-    fn no_corners() {
-        let r1 = Rect::new(32., 32., 64., 64.);
-        let r2 = Rect::new(0., 0., 32., 32.);
-        assert_eq!(SinglePointQuadTree::bordering_direction(&r1, &r2), None);
-        assert_eq!(SinglePointQuadTree::bordering_direction(&r2, &r1), None);
-        let r3 = Rect::new(-32., 32., 0., 64.);
-        let r4 = Rect::new(0., 0., 32., 32.);
-        assert_eq!(SinglePointQuadTree::bordering_direction(&r3, &r4), None);
-        assert_eq!(SinglePointQuadTree::bordering_direction(&r4, &r3), None);
-    }
+        fn inner(bounds: Aabb2d, depth: usize, max_depth: usize) -> QuadNode {
+            if depth == 1 {
+                let nodes = QuadChunk::split(bounds, 0).map(|chunk| QuadNode::Leaf(chunk));
+                return QuadNode::Branch {
+                    children: Box::new(nodes),
+                    chunk: QuadChunk::new(bounds, 1),
+                };
+            }
 
-    #[test]
-    fn overlapping() {
-        let r1 = Rect::new(96., 96., 128., 128.);
-        assert_eq!(SinglePointQuadTree::bordering_direction(&r1, &r1), None);
-    }
-
-    #[test]
-    fn bordering_none() {
-        let r1 = Rect::new(96., 96., 128., 128.);
-        let r2 = Rect::new(0., 0., 64., 64.);
-        assert_eq!(SinglePointQuadTree::bordering_direction(&r1, &r2), None);
-    }
-
-    #[test]
-    fn bordering_bot_wider() {
-        let y = 64.;
-        let r1 = Rect::new(0., y, 64., 128.);
-        let r2 = Rect::new(0., 0., 64., y);
-        assert_eq!(
-            SinglePointQuadTree::bordering_direction(&r1, &r2),
-            Some(NeighbourIn::Bottom)
-        );
-    }
-
-    #[test]
-    fn bordering_top_wider() {
-        let y = 64.;
-        let r1 = Rect::new(0., 0., 64., y);
-        let r2 = Rect::new(0., y, 64., y + 64.);
-        assert_eq!(
-            SinglePointQuadTree::bordering_direction(&r1, &r2),
-            Some(NeighbourIn::Top)
-        );
+            let nodes =
+                QuadNode::split_bounds(bounds).map(|bounds| inner(bounds, depth - 1, max_depth));
+            return QuadNode::Branch {
+                children: Box::new(nodes),
+                chunk: QuadChunk::new(bounds, depth),
+            };
+        }
+        inner(bounds, depth, depth)
     }
 }
 
@@ -964,7 +961,7 @@ enum TerrainRenderState {
     /// Ensure init scripts are loaded
     Loading,
     /// Updates a height map at (pos, buffer_index)
-    Update(Vec<TerrainChunk>),
+    Update,
     Coarse,
     // Runs vertex height adjustment and fragment shaders
     Monitor,
@@ -988,14 +985,7 @@ impl render_graph::Node for TerrainRenderNode {
             TerrainRenderState::Loading => {
                 match pipeline_cache.get_compute_pipeline_state(pipeline.height_map_pipeline) {
                     CachedPipelineState::Ok(_) => {
-                        // todo: We want to check if the chunks have changed and cause a redraw, but
-                        // technically terrain buffer indexes handles this (for now)
-                        let chunks = world
-                            .query::<&TerrainChunk>()
-                            .iter(&world)
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        self.state = TerrainRenderState::Update(chunks);
+                        self.state = TerrainRenderState::Update;
                     }
                     // If the shader hasn't loaded yet, just wait.
                     CachedPipelineState::Err(PipelineCacheError::ShaderNotLoaded(_)) => {}
@@ -1006,19 +996,14 @@ impl render_graph::Node for TerrainRenderNode {
                 }
             }
             TerrainRenderState::Coarse => {}
-            TerrainRenderState::Update(_) => {
+            TerrainRenderState::Update => {
                 if !world.is_resource_changed::<HeightMapUniforms>() {
                     self.state = TerrainRenderState::Monitor;
                 }
             }
             TerrainRenderState::Monitor => {
                 if world.is_resource_changed::<HeightMapUniforms>() {
-                    let chunks = world
-                        .query::<&TerrainChunk>()
-                        .iter(&world)
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    self.state = TerrainRenderState::Update(chunks);
+                    self.state = TerrainRenderState::Update;
                 }
             }
         }
@@ -1030,6 +1015,8 @@ impl render_graph::Node for TerrainRenderNode {
         world: &'w World,
     ) -> std::result::Result<(), render_graph::NodeRunError> {
         let height_map_params = &world.resource::<HeightMapUniforms>();
+        let terrain_images = world.resource::<TerrainGpuImages>();
+        let terrain_bind_groups = world.resource::<TerrainBindGroups>();
         let pipeline_cache = world.resource::<PipelineCache>();
         let terrain_pipeline = world.resource::<TerrainPipeline>();
         let gpu_images = world.resource::<RenderAssets<GpuImage>>();
@@ -1038,41 +1025,20 @@ impl render_graph::Node for TerrainRenderNode {
         match &self.state {
             TerrainRenderState::Loading => {}
             TerrainRenderState::Coarse => {}
-            TerrainRenderState::Update(chunks) => {
+            TerrainRenderState::Update => {
+                let height_map_gpu = gpu_images.get(&terrain_images.height_map).unwrap();
+                let size = height_map_gpu.size_2d();
+
                 let pipeline = pipeline_cache
                     .get_compute_pipeline(terrain_pipeline.height_map_pipeline)
                     .unwrap();
-                for chunk in chunks {
-                    let height_map_gpu = gpu_images.get(&chunk.gpu_image).unwrap();
-                    let size = height_map_gpu.size_2d();
-                    let mut uniform_buffer = UniformBuffer::from(HeightMapUniforms {
-                        frequency: height_map_params.frequency,
-                        lacunarity: height_map_params.lacunarity,
-                        octaves: height_map_params.octaves,
-                        persistence: height_map_params.persistence,
-                        x_from: (chunk.pos.x as f32) * 2.,
-                        x_to: (chunk.pos.x as f32 + chunk.size.x as f32) * 2.,
-                        y_from: (chunk.pos.y as f32) * 2.,
-                        y_to: (chunk.pos.y as f32 + chunk.size.y as f32) * 2.,
-                    });
-                    uniform_buffer.write_buffer(&render_context.render_device(), &queue);
 
-                    let bind_group = render_context.render_device().create_bind_group(
-                        Some("height_map_bind_group"),
-                        &terrain_pipeline.texture_bind_group_layout,
-                        &BindGroupEntries::sequential((
-                            &height_map_gpu.texture_view,
-                            &uniform_buffer,
-                        )),
-                    );
-
-                    let mut pass = render_context
-                        .command_encoder()
-                        .begin_compute_pass(&ComputePassDescriptor::default());
-                    pass.set_bind_group(0, &bind_group, &[]);
-                    pass.set_pipeline(pipeline);
-                    pass.dispatch_workgroups(size.x / 8, size.y / 8, 1);
-                }
+                let mut pass = render_context
+                    .command_encoder()
+                    .begin_compute_pass(&ComputePassDescriptor::default());
+                pass.set_bind_group(0, &terrain_bind_groups.height_map, &[]);
+                pass.set_pipeline(pipeline);
+                pass.dispatch_workgroups(size.x / 8, size.y / 8, 1);
             }
             TerrainRenderState::Monitor => {}
         }
@@ -1128,7 +1094,7 @@ impl HeightMapUniforms {
 
 #[derive(Resource)]
 struct TerrainPipeline {
-    texture_bind_group_layout: BindGroupLayout,
+    height_map_bind_group_layout: BindGroupLayout,
     height_map_pipeline: CachedComputePipelineId,
 }
 
@@ -1160,8 +1126,40 @@ impl TerrainPipeline {
             ..Default::default()
         });
         commands.insert_resource(TerrainPipeline {
-            texture_bind_group_layout: bind_group_layout,
+            height_map_bind_group_layout: bind_group_layout,
             height_map_pipeline: pipeline,
+        });
+    }
+}
+
+#[derive(Resource, Clone, ExtractResource)]
+struct TerrainBindGroups {
+    height_map: BindGroup,
+}
+
+impl TerrainBindGroups {
+    fn prepare(
+        mut commands: Commands,
+        terrain_pipeline: Res<TerrainPipeline>,
+        gpu_images: Res<RenderAssets<GpuImage>>,
+        terrain_images: Res<TerrainGpuImages>,
+        height_map_uniforms: Res<HeightMapUniforms>,
+        render_device: Res<RenderDevice>,
+        queue: Res<RenderQueue>,
+    ) {
+        let height_map_gpu = gpu_images.get(&terrain_images.height_map).unwrap();
+        let _size = height_map_gpu.size_2d();
+        let mut uniform_buffer = UniformBuffer::from(height_map_uniforms.into_inner());
+        uniform_buffer.write_buffer(&render_device, &queue);
+
+        let bind_group = render_device.create_bind_group(
+            Some("height_map_bind_group"),
+            // todo(next-bevy): Will use pipeline cache for this
+            &terrain_pipeline.height_map_bind_group_layout,
+            &BindGroupEntries::sequential((&height_map_gpu.texture_view, &uniform_buffer)),
+        );
+        commands.insert_resource(TerrainBindGroups {
+            height_map: bind_group,
         });
     }
 }
@@ -1172,7 +1170,7 @@ struct TerrainGpuImages {
     /// This is our global height maps for our quad trees,
     /// when a new quad tree is created we generate the height map once and store it.
     /// I GUESS!?
-    height_maps: Handle<Image>,
+    height_map: Handle<Image>,
     cpu_update_timer: Option<Timer>,
 }
 
@@ -1278,9 +1276,9 @@ impl TerrainGpuImages {
             timer.tick(time.delta());
             if timer.is_finished() {
                 terrain_images.cpu_update_timer = None;
-                let lod0_handle = height_maps.lod0_height_map.clone();
+                let lod0_handle = height_maps.height_map.clone();
                 commands
-                    .spawn(Readback::texture(terrain_images.height_maps.clone()))
+                    .spawn(Readback::texture(terrain_images.height_map.clone()))
                     .observe(
                         move |ev: On<ReadbackComplete>,
                               mut commands: Commands,
@@ -1303,69 +1301,22 @@ impl TerrainGpuImages {
         mut commands: Commands,
         mut images: ResMut<Assets<Image>>,
         terrain_settings: Res<TerrainSettings>,
-        mut meshes: ResMut<Assets<Mesh>>,
-        asset_server: Res<AssetServer>,
     ) {
-        let mut height_map =
+        let mut height_map_image =
             Image::new_target_texture(HEIGHT_MAP_SIZE, HEIGHT_MAP_SIZE, TextureFormat::Rgba32Float);
-        height_map.asset_usage = RenderAssetUsages::RENDER_WORLD;
-        height_map.texture_descriptor.usage = TextureUsages::COPY_DST
+        height_map_image.asset_usage = RenderAssetUsages::RENDER_WORLD;
+        height_map_image.texture_descriptor.usage = TextureUsages::COPY_DST
             | TextureUsages::STORAGE_BINDING
             | TextureUsages::TEXTURE_BINDING
             | TextureUsages::COPY_SRC;
         // height_map.sampler = ImageSampler::nearest();
 
         commands.insert_resource(TerrainGpuImages {
-            height_maps: images.add(height_map.clone()),
+            height_map: images.add(height_map_image.clone()),
             cpu_update_timer: Some(Timer::new(
                 Duration::new(HEIGHTMAP_DEBOUNCE_SECS, 0),
                 TimerMode::Once,
             )),
-        });
-        // todo: We need a stitch buffer that houses every possible division of stitching required
-        // from our QuadTree
-        // this makes CHUNK_SIZE vertices at the edge...
-        // so 64
-        let subdivisions = 8 as u32 - 1;
-        // the half res needs to be 32,
-        // so 64 / 2 - 1
-        let full_res = subdivisions as usize + 2;
-        let half_res = (full_res / 2) + 1;
-        commands.insert_resource(TerrainMeshes {
-            center: meshes.add(
-                Plane3d::new(Vec3::Y, Vec2::splat(CHUNK_SIZE))
-                    .mesh()
-                    .subdivisions(subdivisions)
-                    .build(),
-            ),
-            north_stitch: meshes.add(Mesh::from(generate_stitched_plane_north(
-                full_res,
-                half_res,
-                full_res,
-                CHUNK_SIZE * 2.,
-                CHUNK_SIZE * 2.,
-            ))),
-            east_stitch: meshes.add(Mesh::from(generate_stitched_plane_east(
-                full_res,
-                half_res,
-                full_res,
-                CHUNK_SIZE * 2.,
-                CHUNK_SIZE * 2.,
-            ))),
-            south_stitch: meshes.add(Mesh::from(generate_stitched_plane_south(
-                full_res,
-                half_res,
-                full_res,
-                CHUNK_SIZE * 2.,
-                CHUNK_SIZE * 2.,
-            ))),
-            west_stitch: meshes.add(Mesh::from(generate_stitched_plane_west(
-                full_res,
-                half_res,
-                full_res,
-                CHUNK_SIZE * 2.,
-                CHUNK_SIZE * 2.,
-            ))),
         });
         // we need to calculate the overlap
         commands.insert_resource(HeightMapUniforms {
@@ -1373,10 +1324,10 @@ impl TerrainGpuImages {
             lacunarity: terrain_settings.lacunarity,
             octaves: terrain_settings.octaves as i32,
             persistence: terrain_settings.persistence,
-            x_from: terrain_settings.x_bounds.0 as f32,
-            x_to: terrain_settings.x_bounds.1 as f32,
-            y_from: terrain_settings.y_bounds.0 as f32,
-            y_to: terrain_settings.y_bounds.1 as f32,
+            x_from: -1.,
+            x_to: 1.,
+            y_from: -1.,
+            y_to: 1.,
         });
     }
 }
@@ -1386,40 +1337,16 @@ impl TerrainGpuImages {
 // well.
 #[derive(Resource, Clone)]
 struct TerrainHeightMaps {
-    lod0_height_map: Handle<Image>,
-    lod1_height_map: Handle<Image>,
-    lod2_height_map: Handle<Image>,
+    height_map: Handle<Image>,
 }
 
 impl TerrainHeightMaps {
     fn startup(mut commands: Commands, mut assets: ResMut<Assets<Image>>) {
-        let mut lod0_image = Image::new_target_texture(
-            HEIGHT_MAP_SIZE,
-            HEIGHT_MAP_SIZE * LOD0_BUFFER_SIZE,
-            TextureFormat::Rgba32Float,
-        );
-        lod0_image.asset_usage = RenderAssetUsages::MAIN_WORLD;
-        lod0_image.reinterpret_stacked_2d_as_array(LOD0_BUFFER_SIZE);
-
-        let mut lod1_image = Image::new_target_texture(
-            LOD1_HEIGHT_MAP_SIZE,
-            LOD1_HEIGHT_MAP_SIZE * LOD1_BUFFER_SIZE,
-            TextureFormat::Rgba32Float,
-        );
-        lod1_image.asset_usage = RenderAssetUsages::MAIN_WORLD;
-        lod1_image.reinterpret_stacked_2d_as_array(LOD1_BUFFER_SIZE);
-
-        let mut lod2_image = Image::new_target_texture(
-            LOD2_HEIGHT_MAP_SIZE,
-            LOD2_HEIGHT_MAP_SIZE * LOD2_BUFFER_SIZE,
-            TextureFormat::Rgba32Float,
-        );
-        lod2_image.asset_usage = RenderAssetUsages::MAIN_WORLD;
-        lod2_image.reinterpret_stacked_2d_as_array(LOD2_BUFFER_SIZE);
+        let mut height_map =
+            Image::new_target_texture(HEIGHT_MAP_SIZE, HEIGHT_MAP_SIZE, TextureFormat::Rgba32Float);
+        height_map.asset_usage = RenderAssetUsages::MAIN_WORLD;
         commands.insert_resource(TerrainHeightMaps {
-            lod0_height_map: assets.add(lod0_image),
-            lod1_height_map: assets.add(lod1_image),
-            lod2_height_map: assets.add(lod2_image),
+            height_map: assets.add(height_map),
         });
     }
 }
@@ -1459,8 +1386,8 @@ impl TerrainCollider {
     fn collider_from_image_and_mesh(image: &Image, layer: u32, mesh: &Mesh) -> Collider {
         let image_size = image.size();
         let mut mesh = mesh.clone();
-        let half = CHUNK_SIZE;
-        let full = CHUNK_SIZE * 2.;
+        let half = CHUNK_HALF_SIZE;
+        let full = CHUNK_HALF_SIZE * 2.;
         if let Some(VertexAttributeValues::Float32x3(positions)) =
             mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION)
         {
@@ -1488,13 +1415,8 @@ impl TerrainCollider {
 #[derive(Component, Clone, Debug, ExtractComponent)]
 struct TerrainChunk {
     pub center: Vec2,
-    pub direction: StitchIn,
     pub pos: IVec2,
     pub size: IVec2,
-    // heightmap to populate
-    pub gpu_image: Handle<Image>,
-    // heightmap readback
-    pub image: Option<Handle<Image>>,
     pub heights_buffer: Handle<ShaderStorageBuffer>,
 }
 
@@ -1520,12 +1442,14 @@ pub struct TerrainChunkView {
     // entire quad tree to be recalculated over the top of us. the problem here though is that we'd
     // cause a lag spike, a decent solution would be to have a double buffer and load the next quad
     // tree in the background swapping over after some time.
-    quad: SinglePointQuadTree,
-    view_distance: f32,
+    quad: QuadNode,
+    terrain_size: f32,
+    terrain_height: f32,
+    chunk_size: f32,
 }
 
 #[derive(PartialEq, Eq, Debug, PartialOrd, Ord, Hash)]
-pub enum NeighbourIn {
+pub enum Neighbouring {
     Top,
     Right,
     Bottom,
@@ -1534,31 +1458,177 @@ pub enum NeighbourIn {
 
 impl TerrainChunkView {
     fn update_debug_quad_tree(
-        chunk_views: Query<&TerrainChunkView, Changed<Transform>>,
+        chunk_views: Query<(&GlobalTransform, &TerrainChunkView), Changed<Transform>>,
         mut gizmos: Gizmos,
     ) {
-        for view in chunk_views {
-            view.quad.debug(&mut gizmos);
+        for (g_transform, view) in chunk_views {
+            view.quad.debug_chunks(
+                g_transform
+                    .translation()
+                    .truncate()
+                    .with_y(g_transform.translation().z),
+                &mut gizmos,
+            );
         }
     }
 
-    pub fn new() -> Self {
+    // todo: The meshes are created with a fixed size. we need to create the meshes in our setup
+    // function to be the size of a chunk.
+    pub fn new(chunk_size: f32, world_size: f32) -> Self {
+        let depth = (world_size / chunk_size).log2() as usize;
         Self {
-            quad: SinglePointQuadTree { nodes: vec![] },
-            view_distance: TERRAIN_VIEW_DISTANCE,
+            quad: QuadNode::new(
+                Aabb2d {
+                    min: Vec2::splat(0.),
+                    max: Vec2::splat(world_size),
+                },
+                depth,
+            ),
+            terrain_height: TERRAIN_MAX_HEIGHT,
+            terrain_size: world_size,
+            chunk_size: chunk_size,
         }
     }
 
-    // todo: To make this more fluid we actually need to sample the point the player is moving
-    // towards as well by approx the smallest chunk's size. this way we can load in the high
-    // resolution across boarders preventing pop-in
-    fn new_quad_tree(&mut self, position: Vec2) -> SinglePointQuadTree {
-        let bot_left = Vec2::splat(-self.view_distance / 2.);
-        let top_right = Vec2::splat(self.view_distance / 2.);
-        // todo: If we make this 3d we can allow flying lel
-        // now we can use a single instanced mesh for all of our geometry.
-        // The size of the quad tree will dictate the geometry
-        SinglePointQuadTree::new(bot_left, top_right, Vec2::splat(CHUNK_SIZE * 2.), position)
+    /// Updates meshes based on the distance to the camera,
+    fn setup(
+        mut commands: Commands,
+        mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
+        terrain_loading: Res<TerrainLoadingImages>,
+        terrain_images: Res<TerrainGpuImages>,
+        mut meshes: ResMut<Assets<Mesh>>,
+        mut height_map_uniforms: ResMut<HeightMapUniforms>,
+        chunk_views: Query<(Entity, &GlobalTransform, &mut TerrainChunkView), Changed<Transform>>,
+        mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    ) {
+        for (entity, g_transform, view) in chunk_views {
+            let chunk_half_size = view.chunk_size / 2.;
+            // todo: We need a stitch buffer that houses every possible division of stitching required
+            // from our QuadTree
+            // this makes CHUNK_SIZE vertices at the edge...
+            // so 64
+            let subdivisions = 32 as u32 - 1;
+            // the half res needs to be 32,
+            // so 64 / 2 - 1
+            let full_res = subdivisions as usize + 2;
+            let half_res = (full_res / 2) + 1;
+            // todo Terrain Meshes need's to be a component that livex next to our TerrainChunkView
+            let terrain_meshes = TerrainMeshes {
+                center: meshes.add(
+                    Plane3d::new(Vec3::Y, Vec2::splat(chunk_half_size))
+                        .mesh()
+                        .subdivisions(subdivisions)
+                        .build(),
+                ),
+                north_stitch: meshes.add(Mesh::from(generate_stitched_plane_north(
+                    full_res,
+                    half_res,
+                    full_res,
+                    view.chunk_size,
+                    view.chunk_size,
+                ))),
+                east_stitch: meshes.add(Mesh::from(generate_stitched_plane_east(
+                    full_res,
+                    half_res,
+                    full_res,
+                    view.chunk_size,
+                    view.chunk_size,
+                ))),
+                south_stitch: meshes.add(Mesh::from(generate_stitched_plane_south(
+                    full_res,
+                    half_res,
+                    full_res,
+                    view.chunk_size,
+                    view.chunk_size,
+                ))),
+                west_stitch: meshes.add(Mesh::from(generate_stitched_plane_west(
+                    full_res,
+                    half_res,
+                    full_res,
+                    view.chunk_size,
+                    view.chunk_size,
+                ))),
+            };
+            commands.entity(entity).insert(terrain_meshes.clone());
+            let initially_visible = view.quad.refined_nodes_with_id(
+                g_transform
+                    .translation()
+                    .with_y(g_transform.translation().z)
+                    .truncate(),
+            );
+
+            for node in view.quad.all() {
+                let chunk = node.chunk();
+                let quad_scale = chunk.bound.half_size() / chunk_half_size;
+
+                // We create a heights data for each vertex in our mesh I GUESS?
+                let heights_data: Vec<f32> = vec![0.; 0];
+
+                let heights_buffer = buffers.add(ShaderStorageBuffer::from(heights_data));
+
+                let (visibility, mesh) = if initially_visible.contains_key(&chunk.id) {
+                    let mut neighbours_in_direction = node
+                        .neighbours(&initially_visible)
+                        .into_iter()
+                        .filter(|(_, neighbour_node)| {
+                            let neighbour_chunk = neighbour_node.chunk();
+                            (chunk.level as i32 - neighbour_chunk.level as i32) < 0
+                        })
+                        .map(|(neighbouring, _)| neighbouring)
+                        .collect::<HashSet<_>>()
+                        .into_iter()
+                        // todo: Tis v. slow we need t
+                        .collect::<Vec<_>>();
+                    neighbours_in_direction.sort();
+                    let stitch_in = StitchIn::from_neighbour_in(neighbours_in_direction);
+                    info!("{:?}", stitch_in);
+                    (
+                        Visibility::Visible,
+                        terrain_meshes.mesh_from_stitch_direction(&stitch_in),
+                    )
+                } else {
+                    (Visibility::Hidden, terrain_meshes.center.clone())
+                };
+
+                // todo: We can use batch here
+                commands.spawn((
+                    Transform::from_translation(
+                        chunk
+                            .bound
+                            .center()
+                            .with_y(0.)
+                            .extend(chunk.bound.center().y),
+                    )
+                    .with_scale(Vec3::new(quad_scale.x, 1., quad_scale.y)),
+                    TerrainChunk {
+                        center: chunk.bound.center(),
+                        // todo: chunk.pos is looking somewhat incorrect, we should probably fix
+                        // it?
+                        pos: chunk.pos(Vec2::splat(view.chunk_size)),
+                        size: (chunk.bound.half_size() / (chunk_half_size)).as_ivec2(),
+                        heights_buffer: heights_buffer.clone(),
+                    },
+                    visibility,
+                    MeshMaterial3d(terrain_materials.add(TerrainMaterial {
+                        height_map: terrain_images.height_map.clone(),
+                        ground_textures: terrain_loading.ground.clone(),
+                        ground_normals: terrain_loading.ground_normal.clone(),
+                        slope_textures: terrain_loading.slope.clone(),
+                        slope_normals: terrain_loading.slope_normal.clone(),
+                        params: TerrainMaterialParams {
+                            offset: (chunk.bound.min / view.terrain_size) * HEIGHT_MAP_SIZE as f32,
+                            size: ((chunk.bound.half_size() * 2.) / view.terrain_size)
+                                * HEIGHT_MAP_SIZE as f32,
+                            height_mult: view.terrain_height,
+                        },
+                        heights_buffer,
+                    })),
+                    Wireframe,
+                    Mesh3d(mesh),
+                ));
+                height_map_uniforms.set_changed();
+            }
+        }
     }
 
     ///
@@ -1566,11 +1636,13 @@ impl TerrainChunkView {
     fn update_meshes(
         mut commands: Commands,
         mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
-        terrain_meshes: Res<TerrainMeshes>,
         terrain_images: Res<TerrainGpuImages>,
         terrain_loading: Res<TerrainLoadingImages>,
         mut height_map_uniforms: ResMut<HeightMapUniforms>,
-        chunk_views: Query<(&GlobalTransform, &mut TerrainChunkView), Changed<Transform>>,
+        chunk_views: Query<
+            (&GlobalTransform, &mut TerrainChunkView, &TerrainMeshes),
+            Changed<Transform>,
+        >,
         chunks: Query<(Entity, &TerrainChunk)>,
         mut images: ResMut<Assets<Image>>,
         mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
@@ -1578,98 +1650,11 @@ impl TerrainChunkView {
         if !terrain_loading.texture_loaded {
             return;
         }
-        for (g_transform, mut view) in chunk_views {
-            let quad_tree = view.new_quad_tree(
-                // Vec2::ZERO,
-                g_transform
-                    .translation()
-                    .with_y(g_transform.translation().z)
-                    .truncate(),
-            );
-            let (added, removed) = quad_tree.clone().diff(view.quad.clone());
-            view.quad = quad_tree;
-
-            for (entity, chunk) in chunks {
-                if removed
-                    .iter()
-                    .find(|(rect, direction)| {
-                        rect.center() == chunk.center && chunk.direction == *direction
-                    })
-                    .is_some()
-                {
-                    commands.entity(entity).despawn();
-                }
-            }
-            // let origin = (g_transform.translation().truncate() / CHUNK_SIZE).as_ivec2();
-            for (quad, direction) in added {
-                height_map_uniforms.set_changed();
-                let quad_scale = quad.size() / (CHUNK_SIZE * 2.);
-                // // todo: We can probably get away with a decently high resolution texture across
-                // // eac quad
-                let mut gpu_image = Image::new_target_texture(
-                    (CHUNK_SIZE * 2.) as u32 as u32,
-                    (CHUNK_SIZE * 2.) as u32 as u32,
-                    TextureFormat::Rgba32Float,
-                );
-                gpu_image.asset_usage = RenderAssetUsages::RENDER_WORLD;
-                gpu_image.texture_descriptor.dimension =
-                    bevy::render::render_resource::TextureDimension::D2;
-                gpu_image.texture_descriptor.usage = TextureUsages::COPY_DST
-                    | TextureUsages::STORAGE_BINDING
-                    | TextureUsages::TEXTURE_BINDING
-                    | TextureUsages::COPY_SRC;
-                // gpu_image.sampler = ImageSampler::nearest();
-                let image_handle = images.add(gpu_image);
-
-                // We create a heights data for each vertex in our mesh I GUESS?
-                let heights_data: Vec<f32> = vec![0.; 4225 + 1];
-
-                let heights_buffer = buffers.add(ShaderStorageBuffer::from(heights_data));
-
-                let mesh = terrain_meshes.mesh_from_stitch_direction(&direction);
-
-                // todo: We can use batch here
-                commands.spawn((
-                    // todo: We should only need to spawn the collider based on the detail we
-                    // want to load
-                    // TerrainCollider {
-                    //     // the terrain_height_maps lives on the cpu and is updated
-                    //     // automatically with Readbacks from the GPU, snazzy
-                    //     height_map: terrain_height_maps.lod0_height_map.clone(),
-                    //     index: next_index,
-                    //     mesh: terrain_meshes.high_detail.clone(),
-                    // },
-                    Transform::from_translation(quad.center().with_y(0.).extend(quad.center().y))
-                        .with_scale(Vec3::new(quad_scale.x, 1., quad_scale.y)),
-                    TerrainChunk {
-                        direction: direction,
-                        center: quad.center(),
-                        pos: (quad.min / (CHUNK_SIZE * 2.)).as_ivec2(),
-                        size: (quad.size() / (CHUNK_SIZE * 2.)).as_ivec2(),
-                        gpu_image: image_handle.clone(),
-                        // will be readback to from the GPU
-                        image: None,
-                        heights_buffer: heights_buffer.clone(),
-                    },
-                    Visibility::Inherited,
-                    MeshMaterial3d(terrain_materials.add(TerrainMaterial {
-                        height_map: image_handle.clone(),
-                        ground_textures: terrain_loading.ground.clone(),
-                        ground_normals: terrain_loading.ground_normal.clone(),
-                        slope_textures: terrain_loading.slope.clone(),
-                        slope_normals: terrain_loading.slope_normal.clone(),
-                        height_mult: TERRAIN_MAX_HEIGHT,
-                        heights_buffer,
-                    })),
-                    // Wireframe,
-                    Mesh3d(mesh),
-                ));
-            }
-        }
+        for (g_transform, mut view, terrain_meshes) in chunk_views {}
     }
 }
 
-#[derive(Resource)]
+#[derive(Component, Clone)]
 struct TerrainMeshes {
     center: Handle<Mesh>,
     north_stitch: Handle<Mesh>,
@@ -1707,37 +1692,12 @@ fn startup_terrain(
 
 pub type BlendMaterial = ExtendedMaterial<StandardMaterial, TextureArrayMaterial>;
 
-// EZ, we actually get the position from the entity itself, here just handles which buffer indexes
-// are currently in use by our entities. this is neato! Since we can just request a new
-
-// struct TerrainBufferIndex {
-//     max: u32,
-//     // a list of the chunks we want to spawn and their LoD
-//     // requested: Vec<(IVec2, LOD)>,
-//     in_use: HashSet<u32>,
-// }
-
-// impl TerrainBufferIndex {
-//     fn next_free_index(&self) -> Option<u32> {
-//         for idx in 0..self.max {
-//             if self.in_use.get(&idx).is_none() {
-//                 return Some(idx);
-//             }
-//         }
-//         return None;
-//     }
-
-//     /// Claims a buffer position from the available positions.
-//     fn claim(&mut self) -> Option<u32> {
-//         let index = self.next_free_index()?;
-//         self.in_use.insert(index);
-//         Some(index)
-//     }
-
-//     fn free(&mut self, index: u32) {
-//         self.in_use.remove(&index);
-//     }
-// }
+#[derive(Clone, ShaderType, Debug)]
+struct TerrainMaterialParams {
+    offset: Vec2,
+    size: Vec2,
+    height_mult: f32,
+}
 
 #[derive(AsBindGroup, Asset, TypePath, Debug, Clone)]
 pub struct TerrainMaterial {
@@ -1765,7 +1725,7 @@ pub struct TerrainMaterial {
     slope_normals: Handle<Image>,
 
     #[uniform(11)]
-    height_mult: f32,
+    params: TerrainMaterialParams,
 
     #[storage(12)]
     heights_buffer: Handle<ShaderStorageBuffer>,

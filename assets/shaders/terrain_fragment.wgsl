@@ -25,6 +25,14 @@ var height_map_sampler : sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(9) var slope_normals: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(10) var slope_normals_sampler: sampler;
 
+struct TerrainMaterialParams {
+    offset: vec2<f32>,
+    size: vec2<f32>,
+    height_mult: f32,
+}
+
+@group(#{MATERIAL_BIND_GROUP}) @binding(11) var<uniform> params: TerrainMaterialParams;
+
 // Quintic fade curve and its derivative
 fn fade(t: f32) -> f32 {
     return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
@@ -149,11 +157,19 @@ fn combine_normals_rnm(n1: vec3<f32>, n2: vec3<f32>) -> vec3<f32> {
     return normalize(vec3<f32>(t, z));
 }
 
+fn get_global_uv(local_uv: vec2<f32>, texture_size: vec2<f32>) -> vec2<f32> {
+  let size_mult = params.size / texture_size;
+  let offset_uv = params.offset / texture_size;
+
+  return offset_uv + ((local_uv + (0.5 / params.size)) * size_mult);
+}
+
 @fragment
 fn fragment(
     @builtin(front_facing) is_front: bool,
     mesh: VertexOutput,
 ) -> @location(0) vec4<f32> {
+    let dims: vec2<f32> = vec2<f32>(textureDimensions(height_map));
     let uv_coords = mesh.uv;
     // Prepare a 'processed' StandardMaterial by sampling all textures to resolve
     // the material members

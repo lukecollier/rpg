@@ -32,7 +32,9 @@ use bevy::{
     ui_widgets::{Activate, SliderPrecision, SliderStep, ValueChange, observe, slider_self_update},
 };
 use bevy_flycam::prelude::*;
-use bevy_world_gen::terrain::{BlendMaterial, TerrainChunkView, TerrainPlugin, TerrainSettings};
+use bevy_world_gen::terrain::{
+    BlendMaterial, CHUNK_SIZE, TERRAIN_SIZE, TerrainChunkView, TerrainPlugin, TerrainSettings,
+};
 
 const WATER_SHADER_ASSET_PATH: &str = "shaders/water_material.wgsl";
 
@@ -63,7 +65,12 @@ fn main() {
         // terrain systems
         .add_systems(
             Startup,
-            (startup_light, startup_ui, startup_water, startup_camera),
+            (
+                startup_light,
+                startup_ui,
+                // startup_water,
+                startup_camera,
+            ),
         )
         .add_systems(Update, (update_skybox, debug_spawn_physics_cubes))
         .run();
@@ -125,12 +132,12 @@ fn startup_water(
     commands.spawn((
         Mesh3d(
             meshes.add(
-                Plane3d::new(Vec3::Y, Vec2::splat(2048.))
+                Plane3d::new(Vec3::Y, Vec2::splat(1024.))
                     .mesh()
-                    .subdivisions(1024),
+                    .subdivisions(512),
             ),
         ),
-        Transform::from_xyz(0., 128., 0.),
+        Transform::from_xyz(1024., 128., 1024.),
         NotShadowCaster,
         MeshMaterial3d(water_materials.add(ExtendedMaterial {
             base: StandardMaterial {
@@ -292,7 +299,7 @@ fn startup_camera(mut commands: Commands, asset_server: Res<AssetServer>) {
         DepthPrepass,
         DeferredPrepass,
         Camera3d::default(),
-        TerrainChunkView::new(),
+        TerrainChunkView::new(CHUNK_SIZE, TERRAIN_SIZE),
         Hdr,
         Transform::from_xyz(-2.0, 256., 256.0 / 4.).looking_at(Vec3::ZERO, Vec3::Y),
         FlyCam,

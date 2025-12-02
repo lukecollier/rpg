@@ -240,7 +240,6 @@ fn main(@builtin(global_invocation_id) id : vec3<u32>) {
     let noise_value = noise.value * 0.5 + 0.5;
     let noise_deriv = noise.deriv * 0.5 + 0.5;
     // Store height in r, and the derivatives in gba.
-    //vec4<f32>(noise.value, noise.deriv.xyz);
     textureStore(out_image, id.xy, vec4(noise_value, noise_deriv));
 }
 
